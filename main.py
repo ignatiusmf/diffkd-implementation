@@ -1,256 +1,179 @@
-# diffkd_cifar100.py – Bare‑bones DiffKD implementation for CIFAR‑100 with ResNet teachers/students
-# ----------------------------------------------------------------------------------
-# Author: ChatGPT (OpenAI o3)
-# Date : 2025‑06‑06
-# ----------------------------------------------------------------------------------
-# This is **NOT** an official reproduction of the NeurIPS 2023 DiffKD paper.  
-# It captures the *core* ideas in <300 lines of code so you can run quick
-# experiments on CIFAR‑100 with minimal dependencies.  
-# ✔️ PyTorch >=2.0  
-# ✔️ torchvision >=0.17  
-# ❌ fancy schedulers / UNet / EMA / distributed / SLURM scripts
-# ----------------------------------------------------------------------------------
-from __future__ import annotations
-
-import math
-import argparse
 from pathlib import Path
+import argparse
+import json
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, models
 
-###############################################################################
-# 1. Utility helpers
-###############################################################################
 
-def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1,)):
-    """Compute top‑k accuracies (returns list)."""
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target[None, :])
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
+from toolbox.data_loader import Cifar100  
+from toolbox.models import ResNet112, ResNet56  
+from toolbox.utils import evaluate_model, plot_the_things  
 
-###############################################################################
-# 2. Tiny Diffusion‑KD module (no DDPM, just one‑shot denoise + linear AE)
-###############################################################################
-class BottleneckBlock(nn.Module):
-    """ResNet bottleneck without downsample (latent C)."""
+DEVICE = "cuda"
+BATCH_SIZE = 128
+
+parser = argparse.ArgumentParser("Run a training script with custom parameters.")
+parser.add_argument("--experiment_name", default="test", type=str)
+args = parser.parse_args()
+print("\nConfig:", vars(args))
+
+EPOCHS = 150
+DIFF_EPOCHS = 3 
+
+EXPERIMENT_PATH = args.experiment_name
+Path(f"experiments/{EXPERIMENT_PATH}").mkdir(parents=True, exist_ok=True)
+
+
+class LightDiffusion(nn.Module):
 
     def __init__(self, channels: int):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels // 4, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels // 4)
-        self.conv2 = nn.Conv2d(channels // 4, channels // 4, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels // 4)
-        self.conv3 = nn.Conv2d(channels // 4, channels, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(channels)
-        self.act = nn.ReLU(inplace=True)
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+        )
 
     def forward(self, x):
-        identity = x
-        out = self.act(self.bn1(self.conv1(x)))
-        out = self.act(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-        out += identity
-        return self.act(out)
+        return self.net(x)
 
 
-class LightDiffusionKD(nn.Module):
-    """Feature‑level DiffKD as a torch Module.
+def mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return F.mse_loss(a, b, reduction="mean")
 
-    Steps (simplified):
-      1. Compress teacher & student features via 1×1 conv (linear autoencoder enc).
-      2. Treat student latent Z_stu as a *noisy* version of Z_tea.
-      3. Fuse with Gaussian using learnable γ(x) (Adaptive Noise Matching).
-      4. Denoise in one step with 2 bottleneck blocks (Φ).
-      5. MSE loss between denoised student & teacher latent.
-    """
 
-    def __init__(self, in_channels: int, latent_dim: int = 512):
-        super().__init__()
-        # linear autoencoder (conv 1×1)
-        self.enc = nn.Conv2d(in_channels, latent_dim, kernel_size=1, bias=False)
-        self.dec = nn.Conv2d(latent_dim, in_channels, kernel_size=1, bias=False)
+teacher = ResNet112(100).to(DEVICE)
+teacher.load_state_dict(torch.load("toolbox/Cifar100_ResNet112.pth", weights_only=True)["weights"])
+teacher.eval()
+for p in teacher.parameters():
+    p.requires_grad_(False)
 
-        # light diffusion network Φ
-        self.phi = nn.Sequential(
-            BottleneckBlock(latent_dim),
-            BottleneckBlock(latent_dim),
-        )
-        # adaptive noise weight predictor (global avg‑pool → fc → σ)
-        self.noise_weight = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(in_channels, 1),
-        )
+student = ResNet56(100).to(DEVICE)
 
-    def forward(self, f_stu: torch.Tensor, f_tea: torch.Tensor):
-        """Return loss and optional debug tensors."""
-        # Encode to latent space
-        z_tea = self.enc(f_tea).detach()  # stop grad through teacher path
-        z_stu = self.enc(f_stu)
+Data = Cifar100(BATCH_SIZE)
+trainloader, testloader = Data.trainloader, Data.testloader
 
-        # estimate γ in (0,1)
-        gamma = torch.sigmoid(self.noise_weight(f_stu)).view(-1, 1, 1, 1)
-        noise = torch.randn_like(z_stu)
-        z_noisy = gamma * z_stu + (1.0 - gamma) * noise
 
-        # One‑step denoising (Φ)
-        z_denoised = self.phi(z_noisy)
+latent_channels = 64  
+phi = LightDiffusion(latent_channels).to(DEVICE)
 
-        kd_loss = F.mse_loss(z_denoised, z_tea)
-        return kd_loss, {
-            "gamma": gamma.mean().item(),
-            "kd_loss": kd_loss.item(),
-        }
+optim_phi = optim.SGD(phi.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+sched_phi = optim.lr_scheduler.CosineAnnealingLR(optim_phi, T_max=DIFF_EPOCHS)
 
-###############################################################################
-# 3. Networks – CIFAR‑style ResNets (reshape conv1)
-###############################################################################
+print(f"\n[Stage A] Pre-training diffusion head for {DIFF_EPOCHS} epochs…")
+for epoch in range(DIFF_EPOCHS):
+    phi.train()
+    running_loss = 0.0
 
-def resnet_cifar(resnet_fn, num_classes=100):
-    model = resnet_fn(weights=None)
-    # tweak first conv for 32×32
-    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    model.maxpool = nn.Identity()
-    # fine‑tune final FC
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    return model
+    for inputs, _ in trainloader:
+        inputs = inputs.to(DEVICE)
 
-###############################################################################
-# 4. Training / evaluation
-###############################################################################
-
-def train_one_epoch(model_s, model_t, kd_module, loader, optimizer, device, alpha=1.0):
-    model_s.train()
-    kd_module.train()
-    total_loss, total_cls, total_kd = 0.0, 0.0, 0.0
-    for imgs, targets in loader:
-        imgs, targets = imgs.to(device), targets.to(device)
+        
         with torch.no_grad():
-            feats_t, logits_t = forward_with_feats(model_t, imgs)
-        feats_s, logits_s = forward_with_feats(model_s, imgs)
+            t_feat = teacher(inputs)[2].detach()  
 
-        cls_loss = F.cross_entropy(logits_s, targets)
-        kd_loss, _ = kd_module(feats_s, feats_t)
-        loss = cls_loss + alpha * kd_loss
+        
+        eps = torch.randn_like(t_feat)
+        noisy_t = t_feat + eps
+        pred_eps = phi(noisy_t)
+        loss = mse(pred_eps, eps)
 
-        optimizer.zero_grad()
+        optim_phi.zero_grad()
         loss.backward()
-        optimizer.step()
+        optim_phi.step()
 
-        total_loss += loss.item() * imgs.size(0)
-        total_cls += cls_loss.item() * imgs.size(0)
-        total_kd += kd_loss.item() * imgs.size(0)
-    n = len(loader.dataset)
-    return total_loss / n, total_cls / n, total_kd / n
+        running_loss += loss.item()
 
-
-def evaluate(model, loader, device):
-    model.eval()
-    top1, top5 = 0.0, 0.0
-    with torch.no_grad():
-        for imgs, targets in loader:
-            imgs, targets = imgs.to(device), targets.to(device)
-            output = model(imgs)
-            acc1, acc5 = accuracy(output, targets, topk=(1, 5))
-            top1 += acc1.item() * imgs.size(0)
-            top5 += acc5.item() * imgs.size(0)
-    n = len(loader.dataset)
-    return top1 / n, top5 / n
+    sched_phi.step()
+    print(f"Epoch {epoch+1:03d}/{DIFF_EPOCHS}  |  Ldiff={running_loss/len(trainloader):.4f}")
 
 
-def forward_with_feats(model, x):
-    """Forward pass that also returns last feature map before avg‑pool."""
-    feats = []
-    def hook(_, __, output):
-        feats.append(output)
-    h = model.layer4.register_forward_hook(hook)
-    logits = model(x)
-    h.remove()
-    return feats[0], logits
-
-###############################################################################
-# 5. Main
-###############################################################################
-
-def main():
-    parser = argparse.ArgumentParser(description="Bare‑bones DiffKD on CIFAR‑100")
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.1)
-    parser.add_argument("--alpha", type=float, default=1.0, help="KD loss weight")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--save", type=Path, default=Path("./ckpts"))
-    args = parser.parse_args()
-
-    device = torch.device(args.device)
-
-    # Data – standard CIFAR augmentations
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
-    ])
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
-    ])
-    train_set = datasets.CIFAR100(root="./data", train=True, download=True, transform=transform_train)
-    test_set = datasets.CIFAR100(root="./data", train=False, download=True, transform=transform_test)
-
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=256, shuffle=False, num_workers=4)
-
-    # Teacher / Student
-    teacher = resnet_cifar(models.resnet34).to(device)
-    student = resnet_cifar(models.resnet18).to(device)
-
-    # (Optional) Pre‑train / load teacher weights externally for better results
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
-
-    kd_module = LightDiffusionKD(in_channels=512, latent_dim=512).to(device)
-
-    # Optimizer (only student + kd parameters)
-    params = list(student.parameters()) + list(kd_module.parameters())
-    optimizer = optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=5e‑4)
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 150], gamma=0.1)
-
-    best_acc = 0.0
-    args.save.mkdir(parents=True, exist_ok=True)
-
-    for epoch in range(1, args.epochs + 1):
-        train_loss, cls_loss, kd_loss = train_one_epoch(
-            student, teacher, kd_module, train_loader, optimizer, device, alpha=args.alpha
-        )
-        top1, top5 = evaluate(student, test_loader, device)
-        scheduler.step()
-
-        print(
-            f"Epoch {epoch:3d}/{args.epochs} | train_loss {train_loss:.3f} | "
-            f"cls {cls_loss:.3f} | kd {kd_loss:.3f} | Top‑1 {top1:.2f} | Top‑5 {top5:.2f}"
-        )
-
-        if top1 > best_acc:
-            best_acc = top1
-            torch.save(student.state_dict(), args.save / "best_student.pth")
-
-    print(f"Best Top‑1: {best_acc:.2f}")
+for p in phi.parameters():
+    p.requires_grad_(False)
+phi.eval()
 
 
-if __name__ == "__main__":
-    main()
+torch.save({"weights": phi.state_dict()},  f"experiments/{EXPERIMENT_PATH}/phi_pretrained.pth")
+
+
+
+
+print(f"\n[Stage B] Training student for {EPOCHS} epochs …")
+optim_stu = optim.SGD(student.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+sched_stu = optim.lr_scheduler.CosineAnnealingLR(optim_stu, T_max=EPOCHS)
+
+
+train_hard, train_kd, train_acc = [], [], []
+val_loss, val_acc = [], []
+best_acc = 0.0
+
+for epoch in range(EPOCHS):
+    student.train()
+    running_hard, running_kd, correct, seen = 0.0, 0.0, 0, 0
+
+    for inputs, targets in trainloader:
+        inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+
+        
+        with torch.no_grad():
+            t_feat, _, t_logits = teacher(inputs)[2], None, teacher(inputs)[3]
+            t_feat = t_feat.detach()
+
+        s_feat, _, s_logits = student(inputs)[2], None, student(inputs)[3]
+
+        
+        eps_s = phi(s_feat)  
+        denoised_s = s_feat - eps_s
+        kd_loss = mse(denoised_s, t_feat)
+
+        hard_loss = F.cross_entropy(s_logits, targets)
+        loss = hard_loss + 1.0 * kd_loss
+
+        optim_stu.zero_grad()
+        loss.backward()
+        optim_stu.step()
+
+        
+        running_hard += hard_loss.item()
+        running_kd += kd_loss.item()
+        _, pred = s_logits.max(1)
+        correct += pred.eq(targets).sum().item()
+        seen += targets.size(0)
+
+    sched_stu.step()
+
+    epoch_hard = running_hard / len(trainloader)
+    epoch_kd = running_kd / len(trainloader)
+    epoch_acc = 100.0 * correct / seen
+    train_hard.append(epoch_hard)
+    train_kd.append(epoch_kd)
+    train_acc.append(epoch_acc)
+
+    print(f"Epoch {epoch+1:03d}/{EPOCHS}  |  Hard={epoch_hard:.3f}  KD={epoch_kd:.3f}  Acc={epoch_acc:.2f}%")
+
+    
+    v_loss, v_acc = evaluate_model(student, testloader)
+    val_loss.append(v_loss)
+    val_acc.append(v_acc)
+
+    if v_acc > best_acc:
+        best_acc = v_acc
+        torch.save({'weights': student.state_dict()}, f'experiments/{EXPERIMENT_PATH}/ResNet56.pth')
+
+    
+    plot_the_things((train_hard, train_kd), val_loss, train_acc, val_acc, EXPERIMENT_PATH)
+
+
+with open(f'experiments/{EXPERIMENT_PATH}/metrics.json', 'w') as f:
+    json.dump({
+        "train_hard_loss": train_hard,
+        "train_kd_loss": train_kd,
+        "train_acc": train_acc,
+        "val_loss": val_loss,
+        "val_acc": val_acc,
+    }, f)
+
+print(f"\nTraining finished. Best top‑1 acc: {best_acc:.2f}%  (weights saved)")
