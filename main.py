@@ -176,4 +176,4 @@ with open(f'experiments/{EXPERIMENT_PATH}/metrics.json', 'w') as f:
         "val_acc": val_acc,
     }, f)
 
-print(f"\nTraining finished. Best top‑1 acc: {best_acc:.2f}%  (weights saved)")
+print(f"\nTraining finished. Best top1 acc: {best_acc:.2f}%  (weights saved)")
